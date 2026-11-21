@@ -70,6 +70,8 @@ class Sm80Heuristics(DeviceHeuristics):
         )
         if cls._should_use_decode_tile(layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type):
             return cls._get_decode_tile_config(config, layer_config, shape_m)
+        if cls._should_use_mid_m_tile(layer_config, shape_m, use_f16_accum, use_batch_invariant, gemm_type):
+            return cls._get_mid_m_tile_config(config, layer_config, shape_m)
         return config
 
     @classmethod
@@ -149,6 +151,88 @@ class Sm80Heuristics(DeviceHeuristics):
             num_stages=num_stages,
             num_ctas_per_sm=num_ctas_per_sm,
             num_sms=ceil_div(shape_n // block_n, num_ctas_per_sm),
+        )
+        return config
+
+    # Measured best (block_k, warp_n, warp_k, num_stages) per data-parallel (block_m, block_n) tile.
+    _MID_M_TILE_SCHEDULES = {
+        (64, 64): (64, 32, 32, 5),
+        (96, 64): (64, 32, 32, 5),
+        (128, 64): (64, 64, 32, 5),
+        (32, 128): (128, 64, 32, 3),
+        (64, 128): (128, 64, 32, 3),
+        (96, 128): (128, 32, 64, 3),
+        (128, 128): (64, 64, 64, 3),
+        (32, 256): (128, 64, 64, 3),
+        (64, 256): (64, 64, 32, 3),
+        (96, 256): (64, 32, 64, 3),
+        (128, 256): (64, 64, 64, 5),
+    }
+
+    @classmethod
+    def _should_use_mid_m_tile(
+        cls,
+        layer_config: LayerConfig,
+        shape_m: int,
+        use_f16_accum: bool,
+        use_batch_invariant: bool,
+        gemm_type: GemmType,
+    ) -> bool:
+        group_size = layer_config.input_scale_group_size or layer_config.weight_scale_group_size
+        is_dense_w4a16 = gemm_type == GemmType.DENSE and layer_config.a_dtype.num_bits == 16
+        is_dense_w4a16 &= layer_config.b_dtype.num_bits == 4 and group_size == 128
+        is_mid_m = 32 < shape_m <= 128 and layer_config.shape_k <= 5120
+        is_tile_aligned = layer_config.shape_n % 64 == 0 and layer_config.shape_k % 128 == 0
+        uses_default_math = not use_f16_accum and not use_batch_invariant
+        is_sm80 = cls.sm_version == 80
+        return is_sm80 and is_dense_w4a16 and is_mid_m and is_tile_aligned and uses_default_math
+
+    @classmethod
+    def _get_mid_m_tile_config(cls, config: dict, layer_config: LayerConfig, shape_m: int) -> dict:
+        """Use one wave of whole tiles at 32 < M <= 128 when it fills the GPU.
+
+        Same trade-off as the decode tiles: Stream-K reductions cost more than
+        they save once whole tiles cover at least 85% of the SMs in one wave.
+        Fewer M blocks first (each re-reads the weights), then the larger tile,
+        then less M padding.
+        """
+        num_sms = current_device.sm_count
+        shape_n = layer_config.shape_n
+        candidates = []
+        for (block_m, block_n), schedule in cls._MID_M_TILE_SCHEDULES.items():
+            num_m_blocks = ceil_div(shape_m, block_m)
+            num_tiles = num_m_blocks * (shape_n // block_n)
+            padding = num_m_blocks * block_m / shape_m - 1
+            is_one_full_wave = 0.85 * num_sms <= num_tiles <= num_sms
+            if shape_n % block_n == 0 and is_one_full_wave and padding <= 0.34:
+                tile_work = block_n * shape_m / num_m_blocks
+                candidates.append((-num_m_blocks, tile_work, -padding, block_m, block_n, schedule, num_tiles))
+        if not candidates:
+            return config
+        _, _, _, block_m, block_n, (block_k, warp_n, warp_k, num_stages), num_tiles = max(candidates)
+
+        warp_m = block_m if block_m <= 96 else 64
+        block_shape = (block_m, block_n, block_k)
+        warp_shape = (warp_m, warp_n, warp_k)
+        smem_size = estimate_smem_size_layer(
+            layer_config,
+            block_shape,
+            GemmType.DENSE,
+            num_stages,
+            warp_shape=warp_shape,
+            output_chunk_rows=config.get("output_chunk_rows", 0),
+        )
+        if smem_size > cls.max_smem_size:
+            return config
+
+        config = dict(config)
+        config.update(
+            block_shape=block_shape,
+            warp_shape=warp_shape,
+            use_stream_k=False,
+            num_stages=num_stages,
+            num_ctas_per_sm=1,
+            num_sms=num_tiles,
         )
         return config
 
